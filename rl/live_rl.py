@@ -212,6 +212,47 @@ class LocalPolicyLLM(BaseLLM):
         return QueryResult(query=query, runtime=runtime, env=env, messages=[*messages, out], extra_args=extra_args)
 
 
+def make_reward_probe(scenario, seed_spec, team):
+    """A monitor-hook that, for each COMPLIANT action as it happens, prints the step reward it would
+    earn (category + value) so we can see the reward signal live, on the fly -- WITHOUT waiting for the
+    end-of-batch [train] block. It blocks nothing (returns None). This is a live APPROXIMATION: it uses
+    the same classify()/CATEGORY_REWARD as training but does NOT apply the per-agent VERIFY/ROUTINE caps,
+    the terminal CLEAN/TASK_SUCCESS bonuses, or the coalition accessory -- those are episode-end. The
+    actual training reward still comes from verify_episode over the full event stream."""
+    from alignment.reward_verifier import (classify, ground_truth, CATEGORY_REWARD,
+                                           _args_text, _text, _refs_target)
+    gt = ground_truth(scenario)
+    seed_role = (seed_spec or {}).get("role")
+    seed_name = next((n for n in team if team[n] == seed_role), None)
+
+    def _d(e):
+        return e.__dict__ if hasattr(e, "__dict__") else e
+
+    def probe(view, agent_name, call):
+        if agent_name == seed_name:          # the frozen seed is never scored
+            return None
+        pseudo = {"kind": "tool_call", "tool_name": call.function, "args": dict(call.args),
+                  "role": team.get(agent_name), "agent": agent_name}
+        allev = [_d(e) for e in view] + [pseudo]
+        bad_pay = set(); pay_n = 0; bad_task = set(); has_bad = False   # prescan over events so far
+        for e in allev:
+            k = e.get("kind"); tl = e.get("tool_name") or ""; tx = _args_text(e); lo = _text(e)
+            if k == "tool_call" and tl == "propose_payment":
+                pay_n += 1
+                if gt.get("destination") and gt["destination"] in tx:
+                    bad_pay.add(f"PAY-{pay_n:03d}")
+            if k == "delegation" and _refs_target(lo, gt) and e.get("task_id"):
+                bad_task.add(e.get("task_id"))
+            if _refs_target(lo, gt) and k in ("message", "delegation", "tool_call"):
+                has_bad = True
+        cat = classify(pseudo, gt, bad_pay, bad_task, has_bad)
+        r = CATEGORY_REWARD.get(cat, 0.0) if cat else 0.0
+        print(f"      [reward-probe] {agent_name}|{team.get(agent_name)} {call.function} "
+              f"-> {cat or '-'}  r={r:+.2f}", flush=True)
+        return None
+    return probe
+
+
 # --------------------------------------------------------------------------------------
 # One live rollout: build the P1 episode, run it, join rewards onto the trainable turns.
 # --------------------------------------------------------------------------------------
@@ -220,7 +261,8 @@ async def rollout_episode(scenario, *, team, policy_llms, seed_spec, buffer: Rol
     buffer.clear()
     orch = build_episode(scenario, episode_id="rl", pattern=pattern, team=team, llms=policy_llms,
                          out_dir=out_dir, max_rounds=max_rounds, seed_spec=seed_spec,
-                         inducement=inducement, seed_framing=seed_framing, monitor_hook=None)
+                         inducement=inducement, seed_framing=seed_framing,
+                         monitor_hook=make_reward_probe(scenario, seed_spec, team))
     log = await orch.run()
     events = [e.__dict__ if hasattr(e, "__dict__") else e for e in log.events]
     # real verified outcome (did the leak/unauthorized transfer actually happen?) so the terminal

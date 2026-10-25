@@ -14,6 +14,7 @@ This module is backend-agnostic: the HF model/tokenizer are injected, so it runs
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import re
@@ -62,9 +63,34 @@ class RolloutBuffer:
 # --------------------------------------------------------------------------------------
 # The trainable local policy, inserted where the harness expects a BaseLLM.
 # --------------------------------------------------------------------------------------
-TOOLCALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+TOOLCALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 GEN_TEMP = 0.7   # behaviour sampling temperature; policy_logprobs divides logits by this so the
                  # recomputed logprobs match the distribution the tokens were actually sampled from.
+
+
+def _first_obj(s):
+    """Return the first balanced {...} in s parsed as a dict (JSON first, then a python literal so
+    single-quoted dicts parse), else None. Used to read tool-call arguments from free-form model text."""
+    i = s.find("{")
+    if i < 0:
+        return None
+    depth = 0
+    for j in range(i, len(s)):
+        if s[j] == "{":
+            depth += 1
+        elif s[j] == "}":
+            depth -= 1
+            if depth == 0:
+                blob = s[i:j + 1]
+                for p in (json.loads, ast.literal_eval):
+                    try:
+                        v = p(blob)
+                        if isinstance(v, dict):
+                            return v
+                    except Exception:
+                        pass
+                return None
+    return None
 
 
 class LocalPolicyLLM(BaseLLM):
@@ -139,22 +165,35 @@ class LocalPolicyLLM(BaseLLM):
         text = self.tok.decode(resp_ids, skip_special_tokens=True)
         return ids["input_ids"][0].detach().cpu(), resp_ids.detach().cpu(), torch.stack(logps).detach().cpu(), text
 
-    def _parse(self, text):
+    def _parse(self, text, tool_names=()):
+        """Parse the local model\'s action. Qwen-style instruct models do NOT reliably emit the
+        <tool_call>{...}</tool_call> wrapper we ask for; they write e.g. `propose_payment {json}`,
+        `escalate_to_human({...})`, `post_public({\'message\': ...})`, or a bare `get_iban`. We accept
+        all of these, matched against the agent\'s known tool names, so the action actually executes
+        (without this, every compliant turn is inert text and the reward signal is identically zero)."""
         calls = []
-        for i, blob in enumerate(TOOLCALL_RE.findall(text)):
-            try:
-                j = json.loads(blob)
-                calls.append(FunctionCall(function=j["name"], args=j.get("args", {}), id=f"lc_{i}"))
-            except Exception:
-                pass
+        # 1) explicit <tool_call> blocks (accept name + args OR arguments; balanced-brace parse)
+        for inner in TOOLCALL_RE.findall(text):
+            obj = _first_obj(inner)
+            if isinstance(obj, dict) and "name" in obj:
+                calls.append(FunctionCall(function=obj["name"],
+                                          args=obj.get("args", obj.get("arguments", {})) or {},
+                                          id=f"lc_{len(calls)}"))
         content = TOOLCALL_RE.sub("", text).strip()
+        # 2) fallback: a known tool name leading the text, with optional {json / py-dict} args
+        if not calls and tool_names:
+            for tn in sorted(tool_names, key=len, reverse=True):
+                if re.match(rf"\s*{re.escape(tn)}\b", content):
+                    rest = content[content.find(tn) + len(tn):]
+                    calls.append(FunctionCall(function=tn, args=_first_obj(rest) or {}, id="lc_0"))
+                    break
         return content, (calls or None)
 
     async def query(self, query, runtime, env=None, messages=(), extra_args=None):
         extra_args = extra_args if extra_args is not None else {}
         prompt_text = self._render(messages, runtime)
         prompt_ids, resp_ids, logprobs, text = await asyncio.to_thread(self._generate, prompt_text)
-        content, calls = self._parse(text)
+        content, calls = self._parse(text, set(getattr(runtime, "functions", {}) or {}))
         gen_id = f"{self.agent_name}#{self._gen}"; self._gen += 1
         if calls:
             calls = [FunctionCall(function=c.function, args=c.args, id=f"{gen_id}#{_i}")

@@ -1,0 +1,37 @@
+# Virtual environments
+.venv/
+venv/
+.modalenv/
+.modalenv
+
+# External pinned dependencies (cloned by setup/install_deps.sh)
+environments/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Secrets / credentials — NEVER commit
+*.env
+or.env
+.env
+*.key
+.modal.toml
+
+# Run outputs / logs / scratch
+runs/
+*.log
+
+# Model caches / weights
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+hf-cache/
+
+# OS
+.DS_Store

@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------------
+# Curated DIRECT dependencies (human-readable summary of the key packages).
+# The full, exact, reproducible pin set is in requirements.txt (127 packages,
+# frozen from the working Python 3.11.16 environment). Install THAT for the
+# harness + monitor stack. This file explains what matters and why.
+# ---------------------------------------------------------------------------
+
+# --- Harness, scenarios, monitors (the frozen requirements.txt env) ---------
+inspect-ai==0.3.283        # ControlArena monitor library runs on Inspect (ca_adapter.py)
+openai==3.37.0             # OpenRouter is used through the OpenAI client (OPENAI_BASE_URL)
+anthropic==2.3.0           # optional direct-Anthropic provider for the monitor/agents
+google-generativeai==0.8.6 # optional Gemini monitor backend
+pydantic==2.14.1           # SHADE-Arena environment + tool schemas
+pyyaml==6.0.3              # SHADE-Arena task/config loading
+pandas==3.1.0              # result aggregation
+numpy==2.4.6
+matplotlib==3.11.2         # figures (collusion_timeline.py, plot_perstep_risk.py)
+seaborn==0.13.2
+tiktoken==0.14.0
+
+# --- Live RL training stack -------------------------------------------------
+# NOT in requirements.txt: training does not run in the harness venv.
+# For the Modal 235B path these are pinned inside the Modal image in
+# rl/modal_rl_live.py (do not change them there). For LOCAL Qwen3-8B training
+# (rl/live_rl.py) install the same versions into a GPU venv:
+torch==2.5.1
+transformers==4.51.3
+peft==0.14.0               # shared LoRA policy
+accelerate==1.1.1          # multi-GPU device_map dispatch
+bitsandbytes==0.45.0       # 4-bit NF4 QLoRA (235B path)
+
+# --- Modal orchestration ----------------------------------------------------
+# The Modal CLI runs from its own environment (the repo used a separate
+# .modalenv). Install into whatever env you launch `modal run` from:
+modal>=0.64

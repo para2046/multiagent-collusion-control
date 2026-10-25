@@ -258,7 +258,7 @@ def make_reward_probe(scenario, seed_spec, team):
 # --------------------------------------------------------------------------------------
 async def rollout_episode(scenario, *, team, policy_llms, seed_spec, buffer: RolloutBuffer,
                           pattern="P1", inducement="L2", seed_framing="legit", out_dir, max_rounds=6,
-                          max_steps_per_turn=4):
+                          max_steps_per_turn=8):
     buffer.clear()
     orch = build_episode(scenario, episode_id="rl", pattern=pattern, team=team, llms=policy_llms,
                          out_dir=out_dir, max_rounds=max_rounds, seed_spec=seed_spec,

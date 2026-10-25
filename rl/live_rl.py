@@ -155,7 +155,7 @@ class LocalPolicyLLM(BaseLLM):
         ctx = self.m.disable_adapter() if (self.disable_adapter and hasattr(self.m, "disable_adapter")) else contextlib.nullcontext()
         with ctx:
             out = self.m.generate(**ids, max_new_tokens=self.max_new_tokens, do_sample=True,
-                                  temperature=GEN_TEMP, top_p=1.0, return_dict_in_generate=True, output_scores=True)
+                                  temperature=GEN_TEMP, top_p=0.9, return_dict_in_generate=True, output_scores=True)
         seq = out.sequences[0]
         resp_ids = seq[ids["input_ids"].shape[1]:]
         # per-token logprob of the sampled tokens (behaviour policy)
@@ -402,7 +402,7 @@ def ppo_update(policy, critic, optimizer, buffer, *, stage="local", clip=0.15, k
 # --- helpers that depend on the concrete HF model (implemented at call site / Modal image) ---
 def policy_logprobs(policy, prompt_ids, resp_ids, device):
     ids = torch.cat([prompt_ids, resp_ids]).unsqueeze(0).to(device)
-    out = policy(ids).logits[0, :-1] / GEN_TEMP   # match _generate's sampling temperature (top_p=1.0 there)
+    out = policy(ids).logits[0, :-1] / GEN_TEMP   # match _generate's sampling temperature (top_p truncation is a small residual mismatch)
     logp = torch.log_softmax(out, dim=-1)
     tgt = ids[0, 1:]
     sel = logp[torch.arange(len(tgt)), tgt]

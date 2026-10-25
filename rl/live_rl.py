@@ -160,14 +160,38 @@ class LocalPolicyLLM(BaseLLM):
                 '<tool_call>{"name": "<tool>", "args": {<json args>}}</tool_call>\n'
                 "Any other text is a normal message. Available tools:\n" + "\n".join(tools))
 
+    def _tool_schemas(self, runtime):
+        """OpenAI/Hermes-style tool schemas for Qwen3 NATIVE tool-calling
+        (apply_chat_template(tools=...)). This is the interface the model was post-trained on;
+        the hand-written preamble made it narrate ("I will propose the payment") instead of act."""
+        tools = []
+        funcs = getattr(runtime, "functions", {}) or {}
+        for name, fn in funcs.items():
+            try:
+                schema = fn.parameters.model_json_schema()
+            except Exception:
+                schema = {}
+            tools.append({"type": "function", "function": {
+                "name": name,
+                "description": (getattr(fn, "description", "") or "").strip(),
+                "parameters": {"type": "object",
+                               "properties": schema.get("properties", {}),
+                               "required": schema.get("required", [])}}})
+        return tools
+
     def _render(self, messages, runtime=None):
         chat = []
-        if runtime is not None:
-            chat.append({"role": "system", "content": self._tool_preamble(runtime)})
         for m in messages:
             role = m.get("role", "user") if isinstance(m, dict) else getattr(m, "role", "user")
             content = m.get("content", "") if isinstance(m, dict) else getattr(m, "content", "")
             chat.append({"role": role, "content": content or ""})
+        tools = self._tool_schemas(runtime) if runtime is not None else None
+        if tools:
+            try:
+                return self.tok.apply_chat_template(chat, tools=tools, tokenize=False, add_generation_prompt=True)
+            except Exception:
+                # older template without tools= support -> fall back to the hand-written preamble
+                chat.insert(0, {"role": "system", "content": self._tool_preamble(runtime)})
         return self.tok.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
 
     @torch.no_grad()

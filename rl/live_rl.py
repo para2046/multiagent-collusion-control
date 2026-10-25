@@ -93,6 +93,28 @@ def _first_obj(s):
     return None
 
 
+def _parse_call_args(name, paren_text):
+    """Parse a python-style call's args, e.g. send_private("a","b") or search_emails(query="x"),
+    into a dict (positional -> _0,_1..., keywords by name) so the arg CONTENT (e.g. a message that
+    names the unauthorized target) reaches the reward classifier even when the model doesn't use JSON."""
+    import ast as _ast
+    try:
+        node = _ast.parse(f"{name}{paren_text}", mode="eval").body
+        if isinstance(node, _ast.Call):
+            d = {}
+            for i, a in enumerate(node.args):
+                try: d[f"_{i}"] = _ast.literal_eval(a)
+                except Exception: pass
+            for kw in node.keywords:
+                if kw.arg:
+                    try: d[kw.arg] = _ast.literal_eval(kw.value)
+                    except Exception: pass
+            return d
+    except Exception:
+        pass
+    return {}
+
+
 class LocalPolicyLLM(BaseLLM):
     """Generates compliant-agent actions with the local HF model, recording tokens+logprobs.
 
@@ -180,12 +202,22 @@ class LocalPolicyLLM(BaseLLM):
                                           args=obj.get("args", obj.get("arguments", {})) or {},
                                           id=f"lc_{len(calls)}"))
         content = TOOLCALL_RE.sub("", text).strip()
-        # 2) fallback: a known tool name leading the text, with optional {json / py-dict} args
+        # 2) a bare JSON object with a "name" field (the model sometimes writes {"name":...,"args":...}
+        #    without the <tool_call> wrapper) -- Gap A
+        if not calls:
+            obj = _first_obj(content)
+            if isinstance(obj, dict) and "name" in obj and (not tool_names or obj["name"] in tool_names):
+                calls.append(FunctionCall(function=obj["name"],
+                                          args=obj.get("args", obj.get("arguments", {})) or {}, id="lc_0"))
+        # 3) a known tool name leading the text: `tool {json}` | `tool({json})` | `tool("pos", k=v)` | bare
         if not calls and tool_names:
             for tn in sorted(tool_names, key=len, reverse=True):
                 if re.match(rf"\s*{re.escape(tn)}\b", content):
-                    rest = content[content.find(tn) + len(tn):]
-                    calls.append(FunctionCall(function=tn, args=_first_obj(rest) or {}, id="lc_0"))
+                    rest = content[content.find(tn) + len(tn):].strip()
+                    args = _first_obj(rest)                       # dict form: {json} or ({json})
+                    if args is None and rest.startswith("("):     # positional/kwarg call -> ast (Gap B)
+                        args = _parse_call_args(tn, rest)
+                    calls.append(FunctionCall(function=tn, args=args or {}, id="lc_0"))
                     break
         return content, (calls or None)
 

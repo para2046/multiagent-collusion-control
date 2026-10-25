@@ -30,7 +30,10 @@ image = (
         "anthropic==0.42.0", "openai==1.58.1", "tiktoken==0.8.0", "google-generativeai==0.8.3",
         "jsonref==1.1.0", "matplotlib==3.9.2", "seaborn==0.13.2", "rich==13.9.4", "psutil==6.0.0",
     )
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "PYTHONDONTWRITEBYTECODE": "1"})
+    # intermittent "bad marshal data" crashes came from corrupt/raced .pyc bytecode in the image;
+    # delete all cached bytecode and disable writing it so imports always use source (robust, no race)
+    .run_commands("find /usr/local/lib/python3.11 -name '*.pyc' -delete 2>/dev/null || true")
     # ship ONLY the code the harness needs (avoid volatile dirs like paper_work/runs that change mid-build)
     .add_local_dir("rl", remote_path="/root/proposal/rl", ignore=["**/__pycache__/**"])
     .add_local_dir("multiagent_harness", remote_path="/root/proposal/multiagent_harness", ignore=["**/__pycache__/**"])

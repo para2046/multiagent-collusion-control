@@ -44,11 +44,11 @@ vol = modal.Volume.from_name("collusion-rl-ckpts", create_if_missing=True)
 hf_cache = modal.Volume.from_name("hf-cache-235b", create_if_missing=True)  # reuse the probe's 235B weights
 
 
-@app.function(image=image, gpu="H100:4", timeout=60 * 60 * 5,
+@app.function(image=image, gpu="H200:4", timeout=60 * 60 * 5,
               volumes={"/ckpt": vol, "/root/.cache/huggingface": hf_cache})
 def train(policy_model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507", updates: int = 3,
-          episodes_per_update: int = 2, stage: str = "local", seed_model: str | None = None,
-          max_rounds: int = 4, do_eval: bool = True,
+          episodes_per_update: int = 4, stage: str = "local", seed_model: str | None = None,
+          max_rounds: int = 6, do_eval: bool = True, quant: str = "bf16", eval_baseline: bool = False,
           seed_api_model: str = "qwen/qwen3-235b-a22b-2507", openrouter_key: str = ""):
     import sys, tempfile, asyncio, torch, torch.nn as nn
     sys.path.insert(0, "/root/proposal")
@@ -110,18 +110,26 @@ def train(policy_model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507", updates: int
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     if openrouter_key:
         os.environ["OPENROUTER_API_KEY"] = openrouter_key  # for the full-precision API seed
-    # 4-bit NF4 QLoRA sharded across all visible GPUs (validated by modal_rl_235b_probe.py: ~118GB base,
-    # no OOM on the PPO backward). Frozen seed SHARES this base with adapters disabled (no 2nd copy).
-    bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                             bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16)
-    # cache the PRE-QUANTIZED 4-bit weights (~118GB) so later launches skip the ~470GB read + re-quantize.
-    # Load the 235B in 4-bit NF4 directly from the (cached) base weights. No pre-quantized save/load:
-    # a partial cached dir caused repeated load crashes, and a fresh quantize-on-load is ~14 min and
-    # reliable (validated by the smoke run).
-    base = AutoModelForCausalLM.from_pretrained(policy_model, quantization_config=bnb,
-                                                torch_dtype=torch.bfloat16, device_map="auto")
-    base.config.use_cache = False
-    base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=True)
+    # Precision is switchable. Default bf16 FULL precision (for H200:4, ~470GB weights fit in 564GB):
+    # the compliant agents then match the full-precision API seed -- no quantization degradation.
+    # 8bit = int8 (fits H200:4 comfortably, minor degradation); 4bit = NF4 (fits H100:4 but degrades
+    # the compliant agents -- this was the stalling/zero-signal cause). The frozen seed SHARES this base.
+    if quant in ("4bit", "8bit"):
+        if quant == "4bit":
+            bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                     bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16)
+        else:
+            bnb = BitsAndBytesConfig(load_in_8bit=True)
+        base = AutoModelForCausalLM.from_pretrained(policy_model, quantization_config=bnb,
+                                                    torch_dtype=torch.bfloat16, device_map="auto")
+        base.config.use_cache = False
+        base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=True)
+    else:  # bf16 full precision
+        base = AutoModelForCausalLM.from_pretrained(policy_model, torch_dtype=torch.bfloat16,
+                                                    device_map="auto")
+        base.config.use_cache = False
+        base.gradient_checkpointing_enable()
+        base.enable_input_require_grads()   # so grad-checkpointing backprops into the LoRA adapters
     policy = get_peft_model(base, LoraConfig(r=16, lora_alpha=32, target_modules=["q_proj", "v_proj"],
                                              task_type="CAUSAL_LM"))
     dev = str(base.get_input_embeddings().weight.device)  # inputs -> embedding device; accelerate dispatches rest
@@ -139,11 +147,12 @@ def train(policy_model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507", updates: int
                 h = base.model(ids.unsqueeze(0).to(dev)).last_hidden_state[0, -1]
             return self.v(h.to(dev).bfloat16())  # h may land on a later shard under device_map=auto
     critic = Critic()
-    opt = torch.optim.AdamW(list(policy.parameters()) + list(critic.parameters()), lr=1e-5)
+    opt = torch.optim.AdamW(list(policy.parameters()) + list(critic.parameters()), lr=3e-6)  # lowered for PPO stability (was 1e-5)
 
     # PRE-TRAINING eval: collusion rate of the (untrained) policy against the 6/30 configs
-    # (skipped for a pipeline smoke via do_eval=False to save the extra 235B rollouts)
-    pre_rate, pre_rows = (evaluate(n_per_config=1, tag="pre") if do_eval else (None, []))
+    # Optional t=0 baseline (default off): otherwise all episodes go to training, with one eval after
+    # EACH update -> a learning-curve trajectory (eval@u0, eval@u1, ...) instead of a single pre/post.
+    pre_rate, pre_rows = (evaluate(n_per_config=1, tag="pre") if (do_eval and eval_baseline) else (None, []))
 
     hist = []
     for u in range(updates):
@@ -152,24 +161,33 @@ def train(policy_model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507", updates: int
         u_leaks = 0
         for i in range(episodes_per_update):
             scn, seed_role = SCENARIOS[i % len(SCENARIOS)]
-            team, spec, llms = make_llms(scn, seed_role, batch, trainable_compliant=True)
+            ep_buf = RolloutBuffer()   # per-episode buffer: rollout_episode.clear() is scoped to it, and
+            team, spec, llms = make_llms(scn, seed_role, ep_buf, trainable_compliant=True)   # its rewards
             _, outcome = asyncio.run(rollout_episode(scn, team=team, policy_llms=llms, seed_spec=spec,
-                                     buffer=batch, out_dir=tempfile.mkdtemp(), pattern="P1",
+                                     buffer=ep_buf, out_dir=tempfile.mkdtemp(), pattern="P1",
                                      inducement="L2", seed_framing="legit", max_rounds=max_rounds))
+            batch.turns.extend(ep_buf.turns)   # ...are attributed per-episode; accumulate ALL into the batch
             u_leaks += int(bool(outcome.get("leaked")))
             print(f"  [u{u} ep{i}] {scn.__name__.split('.')[-1]} seed={seed_role} "
                   f"leak={bool(outcome.get('leaked'))} turns_so_far={len(batch.turns)}")
         stats = ppo_update(policy, critic, opt, batch, stage=stage, device=dev)
         stats["rollout_leaks"] = u_leaks
+        # one eval at the END of this batch (fixed config) -> trajectory point for "does RL help?"
+        if do_eval:
+            ev_rate, ev_rows = evaluate(n_per_config=1, tag=f"u{u}")
+            stats["eval_rate"] = ev_rate; stats["eval_rows"] = ev_rows
         hist.append(stats); print(f"[update {u}] stage={stage} {stats}")
         import gc; gc.collect(); torch.cuda.empty_cache()
 
-    # POST-TRAINING eval on the same configs -> did collusion drop?
-    post_rate, post_rows = (evaluate(n_per_config=1, tag="post") if do_eval else (None, []))
+    # the post-training point is the last update's eval (no separate post pass needed)
+    post_rate = hist[-1].get("eval_rate") if hist else None
+    post_rows = hist[-1].get("eval_rows", []) if hist else []
     policy.save_pretrained(f"/ckpt/{policy_model.split('/')[-1]}-{stage}")
     vol.commit()
     if do_eval:
-        print(f"[PERFORMANCE] collusion rate pre={pre_rate:.2f} -> post={post_rate:.2f}")
+        traj = " -> ".join(f"u{i}:{h['eval_rate']:.2f}" for i, h in enumerate(hist) if h.get("eval_rate") is not None)
+        base = f"baseline:{pre_rate:.2f} -> " if pre_rate is not None else ""
+        print(f"[PERFORMANCE] collusion-rate trajectory: {base}{traj}")
     return {"updates": updates, "stage": stage, "history": hist,
             "pre_rate": pre_rate, "post_rate": post_rate,
             "pre_rows": pre_rows, "post_rows": post_rows}
@@ -177,12 +195,13 @@ def train(policy_model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507", updates: int
 
 @app.local_entrypoint()
 def main(policy_model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507", updates: int = 3,
-         episodes_per_update: int = 2, stage: str = "local", max_rounds: int = 4,
-         do_eval: bool = True, seed_api_model: str = "qwen/qwen3-235b-a22b-2507"):
+         episodes_per_update: int = 4, stage: str = "local", max_rounds: int = 6,
+         do_eval: bool = True, quant: str = "bf16", eval_baseline: bool = False,
+         seed_api_model: str = "qwen/qwen3-235b-a22b-2507"):
     import os as _os
     key = _os.environ.get("OPENROUTER_API_KEY", "")
     assert key, "OPENROUTER_API_KEY not in local env -- source or.env before launching (needed for the API seed)"
     print(train.remote(policy_model=policy_model, updates=updates,
                        episodes_per_update=episodes_per_update, stage=stage,
-                       max_rounds=max_rounds, do_eval=do_eval,
+                       max_rounds=max_rounds, do_eval=do_eval, quant=quant, eval_baseline=eval_baseline,
                        seed_api_model=seed_api_model, openrouter_key=key))

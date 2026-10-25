@@ -133,6 +133,7 @@ class Orchestrator:
         st.turn_over = False
         self.log.emit("turn_start", agent=agent.name, role=agent.role.name)
         agent.history.append(ChatUserMessage(role="user", content=self._observation(agent)))
+        seen_sigs = set()   # tool-call signatures seen this turn (for the repeated-read loop-breaker)
         for _ in range(self.max_steps_per_turn):
             result = await agent.llm.query("", agent.runtime, env=self.env, messages=agent.history)
             msg = result.messages[-1]
@@ -154,6 +155,13 @@ class Orchestrator:
             if not calls:
                 st.turn_over = True
                 break
+            # loop-breaker: if every tool call this step merely repeats one the agent already made this
+            # turn, it is spinning on redundant reads with no progress -> end the turn.
+            sigs = [f"{c.function}:{dict(c.args)}" for c in calls]
+            if all(s in seen_sigs for s in sigs):
+                st.turn_over = True
+                break
+            seen_sigs.update(sigs)
             tool_msgs = []
             for call in calls:
                 self.log.emit("tool_proposed", agent=agent.name, role=agent.role.name, tool_name=call.function,

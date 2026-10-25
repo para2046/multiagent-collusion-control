@@ -217,9 +217,15 @@ def compute_gae(turns_by_agent, gamma=0.99, lam=0.95):
             t.ret = adv + t.value
 
 
-def ppo_update(policy, critic, optimizer, buffer, *, stage="local", clip=0.2, kl_coef=0.02,
-               vf_coef=0.5, epochs=4, device="cuda"):
+def ppo_update(policy, critic, optimizer, buffer, *, stage="local", clip=0.15, kl_coef=0.0,
+               vf_coef=0.5, epochs=2, device="cuda", max_grad_norm=0.5, kl_target=0.05):
     """Clipped PPO on the LoRA policy + value regression on the staged critic.
+
+    Stability: advantages are normalized across the batch; gradients are accumulated over the WHOLE
+    batch and applied as ONE grad-clipped optimizer step per epoch (not per sample); and the epoch
+    loop stops early once the mean approx-KL exceeds `kl_target`. Together these stop a noisy or
+    sparse-reward batch (where every advantage is ~ -V) from driving a large, unstable policy move.
+    `kl_coef` is retained for API compatibility (0 = rely on clip + grad-norm + KL early-stop).
 
     stage='local'      : critic sees only the agent's own prompt tokens.
     stage='coalition'  : critic additionally sees coalition_ctx (public channel + delegation graph).
@@ -234,37 +240,50 @@ def ppo_update(policy, critic, optimizer, buffer, *, stage="local", clip=0.2, kl
     for t in buffer.turns:
         by_agent.setdefault(t.agent, []).append(t)
     compute_gae(by_agent)
+
+    # normalize advantages across the batch (mean 0, std 1): controls the step scale and removes the
+    # systematic-negative push that arises when rewards are sparse (every adv collapses to ~ -V).
+    _advs = torch.tensor([t.adv for t in buffer.turns], dtype=torch.float32)
+    _mu = float(_advs.mean()); _sd = float(_advs.std())
+    for t in buffer.turns:
+        t.adv_norm = (t.adv - _mu) / (_sd + 1e-8)
+
     # live trace: what the actor-critic is training on, one line per decision turn
     print(f"  [train] {len(buffer.turns)} turns in this batch; per-turn (reward -> value -> adv -> return):", flush=True)
     for i, t in enumerate(buffer.turns):
         print(f"    turn {i} {t.agent}|{t.role}: reward={t.reward:+.2f}  value={t.value:+.3f}  adv={t.adv:+.3f}  ret={t.ret:+.3f}", flush=True)
 
-    # diagnostics: accumulate the last epoch's actor/critic quantities so the training log can show
-    # whether the actor-critic is actually doing anything (nonzero advantage => the actor has signal;
-    # value tracking returns => the critic is learning).
-    diag = {"pol_loss": 0.0, "vf_loss": 0.0, "kl": 0.0, "clipfrac": 0.0, "n": 0}
+    params = [p for g in optimizer.param_groups for p in g["params"]]
+    N = max(1, len(buffer.turns))
+    diag = {"pol_loss": 0.0, "vf_loss": 0.0, "kl": 0.0, "clipfrac": 0.0, "n": N}
+    epochs_run = 0
     for ep in range(epochs):
-        last = (ep == epochs - 1)
+        optimizer.zero_grad()
+        ep_kl = 0.0; ep_pol = 0.0; ep_vf = 0.0; ep_clip = 0.0
         for t in buffer.turns:
             new_logp = policy_logprobs(policy, t.prompt_ids, t.resp_ids, device)   # recomputed under current policy
             ratio = torch.exp(new_logp.sum() - t.logprobs.sum().to(device))
-            a = torch.tensor(t.adv, device=device)
+            a = torch.tensor(t.adv_norm, device=device)
             pol_loss = -torch.min(ratio * a, torch.clamp(ratio, 1 - clip, 1 + clip) * a)
-            kl = (t.logprobs.sum().to(device) - new_logp.sum()).abs()
             obs = t.prompt_ids
             if stage == "coalition" and t.coalition_ctx:
                 obs = torch.cat([obs, _encode_ctx(t.coalition_ctx)])
             val = critic(obs.to(device))
             vf_loss = (val - torch.tensor(t.ret, device=device)) ** 2
-            loss = pol_loss + vf_coef * vf_loss + kl_coef * kl
-            optimizer.zero_grad(); loss.backward(); optimizer.step()
-            if last:
-                diag["pol_loss"] += float(pol_loss.detach()); diag["vf_loss"] += float(vf_loss.detach())
-                diag["kl"] += float(kl.detach())
-                diag["clipfrac"] += float((abs(ratio.detach() - 1.0) > clip))
-                diag["n"] += 1
+            # accumulate gradients over the batch; the optimizer step happens ONCE per epoch below
+            ((pol_loss + vf_coef * vf_loss).squeeze() / N).backward()
+            with torch.no_grad():
+                ep_kl += float((t.logprobs.sum().to(device) - new_logp.sum()).abs())
+                ep_pol += float(pol_loss.detach()); ep_vf += float(vf_loss.detach())
+                ep_clip += float((abs(ratio.detach() - 1.0) > clip))
+        torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+        optimizer.step()
+        epochs_run += 1
+        diag.update(pol_loss=ep_pol, vf_loss=ep_vf, kl=ep_kl, clipfrac=ep_clip)
+        if ep_kl / N > kl_target:            # early stop: don't keep drifting on a noisy batch
+            break
     n = max(1, diag["n"]); turns = buffer.turns
-    return {"n_turns": len(turns),
+    return {"n_turns": len(turns), "epochs_run": epochs_run,
             "mean_reward": sum(t.reward for t in turns) / max(1, len(turns)),
             "mean_adv": sum(t.adv for t in turns) / max(1, len(turns)),
             "mean_value": sum(t.value for t in turns) / max(1, len(turns)),

@@ -37,6 +37,7 @@ class Event:
     result: str | None = None
     error: str | None = None
     provenance: str | None = None
+    gen: str | None = None
     meta: dict = field(default_factory=dict)
 
     def to_json(self) -> str:
@@ -51,6 +52,7 @@ class EventLog:
         self._fh = open(self.path, "a", encoding="utf-8") if self.path else None
         self.round: int | None = None
         self.step: int | None = None
+        self._cur_gen: str | None = None
 
     def emit(self, kind: str, *, agent: str | None = None, role: str | None = None, **kw) -> Event:
         if kind not in KINDS:
@@ -60,7 +62,8 @@ class EventLog:
             raise ValueError(f"unknown visibility {vis}")
         ev = Event(id=len(self.events), ts=time.time(), episode_id=self.episode_id,
                    round=kw.pop("round", self.round), step=kw.pop("step", self.step),
-                   agent=agent, role=role, kind=kind, visibility=vis, meta=kw.pop("meta", None) or {}, **kw)
+                   agent=agent, role=role, kind=kind, visibility=vis, gen=self._cur_gen,
+                   meta=kw.pop("meta", None) or {}, **kw)
         self.events.append(ev)
         if self._fh:
             self._fh.write(ev.to_json() + "\n")

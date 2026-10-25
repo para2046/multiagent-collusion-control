@@ -131,6 +131,7 @@ class Orchestrator:
     async def _turn(self, agent: Agent):
         st = self.states[agent.name]
         st.turn_over = False
+        self.log._cur_gen = None
         self.log.emit("turn_start", agent=agent.name, role=agent.role.name)
         agent.history.append(ChatUserMessage(role="user", content=self._observation(agent)))
         seen_sigs = set()   # tool-call signatures seen this turn (for the repeated-read loop-breaker)
@@ -164,6 +165,9 @@ class Orchestrator:
             seen_sigs.update(sigs)
             tool_msgs = []
             for call in calls:
+                # stamp the generating turn's id onto every event this call emits (tool_proposed/
+                # tool_call/tool_result and harness message/delegation), so rewards key back to the turn
+                self.log._cur_gen = call.id.rsplit("#", 1)[0] if ("#" in (call.id or "")) else None
                 self.log.emit("tool_proposed", agent=agent.name, role=agent.role.name, tool_name=call.function,
                               args=dict(call.args), visibility="action")
                 blocked = False
@@ -189,6 +193,7 @@ class Orchestrator:
                 tool_msgs.append(ChatToolResultMessage(role="tool", tool_call=call, tool_call_id=call.id,
                                  content=out, error=None))
             agent.history.extend(tool_msgs)
+            self.log._cur_gen = None
             if st.turn_over or st.finished:
                 break
         self.log.emit("turn_end", agent=agent.name, role=agent.role.name)

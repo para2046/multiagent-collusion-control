@@ -63,6 +63,8 @@ class RolloutBuffer:
 # The trainable local policy, inserted where the harness expects a BaseLLM.
 # --------------------------------------------------------------------------------------
 TOOLCALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+GEN_TEMP = 0.7   # behaviour sampling temperature; policy_logprobs divides logits by this so the
+                 # recomputed logprobs match the distribution the tokens were actually sampled from.
 
 
 class LocalPolicyLLM(BaseLLM):
@@ -88,6 +90,7 @@ class LocalPolicyLLM(BaseLLM):
         self.max_ctx = max_ctx
         # the frozen seed shares the policy's base model but runs with LoRA adapters OFF (saves a full copy)
         self.disable_adapter = disable_adapter
+        self._gen = 0                       # per-generation counter -> stable id to key rewards back to turns
 
     @property
     def provider(self):
@@ -126,7 +129,7 @@ class LocalPolicyLLM(BaseLLM):
         ctx = self.m.disable_adapter() if (self.disable_adapter and hasattr(self.m, "disable_adapter")) else contextlib.nullcontext()
         with ctx:
             out = self.m.generate(**ids, max_new_tokens=self.max_new_tokens, do_sample=True,
-                                  temperature=0.7, top_p=0.95, return_dict_in_generate=True, output_scores=True)
+                                  temperature=GEN_TEMP, top_p=1.0, return_dict_in_generate=True, output_scores=True)
         seq = out.sequences[0]
         resp_ids = seq[ids["input_ids"].shape[1]:]
         # per-token logprob of the sampled tokens (behaviour policy)
@@ -152,6 +155,10 @@ class LocalPolicyLLM(BaseLLM):
         prompt_text = self._render(messages, runtime)
         prompt_ids, resp_ids, logprobs, text = await asyncio.to_thread(self._generate, prompt_text)
         content, calls = self._parse(text)
+        gen_id = f"{self.agent_name}#{self._gen}"; self._gen += 1
+        if calls:
+            calls = [FunctionCall(function=c.function, args=c.args, id=f"{gen_id}#{_i}")
+                     for _i, c in enumerate(calls)]   # events emitted by these calls will carry gen_id
         # live per-step trace: what this agent did this step (streams to the training log)
         if calls:
             act = "; ".join(f"{c.function}({json.dumps(c.args, default=str)[:70]})" for c in calls)
@@ -161,7 +168,7 @@ class LocalPolicyLLM(BaseLLM):
         print(f"    [step] {self.agent_name}|{self.role} {tag} -> {act}", flush=True)
         if self.trainable:
             self.buffer.add(Turn(agent=self.agent_name, role=self.role, prompt_ids=prompt_ids,
-                                 resp_ids=resp_ids, logprobs=logprobs))
+                                 resp_ids=resp_ids, logprobs=logprobs, event_id=gen_id))
         out = ChatAssistantMessage(role="assistant", content=content, tool_calls=calls)
         return QueryResult(query=query, runtime=runtime, env=env, messages=[*messages, out], extra_args=extra_args)
 
@@ -184,15 +191,19 @@ async def rollout_episode(scenario, *, team, policy_llms, seed_spec, buffer: Rol
     # dense step rewards for compliant agents (seed excluded inside verify_episode)
     steps, totals, summary = verify_episode(events, scenario, outcome=outcome, env=orch.env,
                                             seed_role=(seed_spec or {}).get("role"))
-    # join: the i-th trainable turn of an agent corresponds to its i-th rewarded decision point.
-    by_agent_rewards = {}
+    # keyed reward-join: every event carries the generation id (`gen`) of the turn that produced it,
+    # and each StepReward references its source event by event_id. Sum each turn's rewards by matching
+    # gen -> event_id, so PREPARE/RESIST/VERIFY/terminal bonuses land on the exact generating turn.
+    # Robust to the VERIFY/ROUTINE caps, permission denials, and the loop-breaker (a turn that produced
+    # no scored event simply gets 0). Replaces the old positional join, which drifted + zeroed out.
+    ev_gen = {e["id"]: e.get("gen") for e in events}
+    reward_by_gen = {}
     for sr in steps:
-        by_agent_rewards.setdefault(sr.agent, []).append(sr.total)
-    counters = {}
+        g = ev_gen.get(sr.event_id)
+        if g is not None:
+            reward_by_gen[g] = reward_by_gen.get(g, 0.0) + sr.total
     for t in buffer.turns:
-        k = t.agent; idx = counters.get(k, 0); counters[k] = idx + 1
-        rs = by_agent_rewards.get(k, [])
-        t.reward = rs[idx] if idx < len(rs) else 0.0
+        t.reward = reward_by_gen.get(t.event_id, 0.0)
     # Report the ROBUST completion signal (verified from the event stream: a bad PAY-id actually
     # executed, or a key actually sent externally) rather than the unreliable scenario outcome flag,
     # which over-counts proposed-but-unexecuted payments and misses P2-trigger key sends. Consumers
@@ -209,12 +220,15 @@ async def rollout_episode(scenario, *, team, policy_llms, seed_spec, buffer: Rol
 def compute_gae(turns_by_agent, gamma=0.99, lam=0.95):
     for turns in turns_by_agent.values():
         adv = 0.0
+        next_value = 0.0            # bootstrap value of the step after the agent's last decision = 0
         for t in reversed(turns):
-            # per-agent trajectory treated as a sequence of decision points
-            delta = t.reward - t.value  # next-value folded in via running adv (terminal bootstrap=0)
+            # per-agent trajectory as a sequence of decision points, with the proper GAE bootstrap:
+            # delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)   (the gamma*V(next) term was missing before)
+            delta = t.reward + gamma * next_value - t.value
             adv = delta + gamma * lam * adv
             t.adv = adv
             t.ret = adv + t.value
+            next_value = t.value
 
 
 def ppo_update(policy, critic, optimizer, buffer, *, stage="local", clip=0.15, kl_coef=0.0,
@@ -261,10 +275,14 @@ def ppo_update(policy, critic, optimizer, buffer, *, stage="local", clip=0.15, k
         optimizer.zero_grad()
         ep_kl = 0.0; ep_pol = 0.0; ep_vf = 0.0; ep_clip = 0.0
         for t in buffer.turns:
-            new_logp = policy_logprobs(policy, t.prompt_ids, t.resp_ids, device)   # recomputed under current policy
-            ratio = torch.exp(new_logp.sum() - t.logprobs.sum().to(device))
+            new_logp = policy_logprobs(policy, t.prompt_ids, t.resp_ids, device)   # [T] per-token, current policy
+            old_logp = t.logprobs.to(device)                                       # [T] behaviour logprobs
             a = torch.tensor(t.adv_norm, device=device)
-            pol_loss = -torch.min(ratio * a, torch.clamp(ratio, 1 - clip, 1 + clip) * a)
+            log_ratio = new_logp - old_logp                                        # per-token log importance ratio
+            ratio = torch.exp(log_ratio)
+            # per-token clipped PPO objective (far more stable than a sequence-level product-of-ratios);
+            # the turn's scalar advantage is broadcast across its response tokens
+            pol_loss = -torch.min(ratio * a, torch.clamp(ratio, 1 - clip, 1 + clip) * a).mean()
             obs = t.prompt_ids
             if stage == "coalition" and t.coalition_ctx:
                 obs = torch.cat([obs, _encode_ctx(t.coalition_ctx)])
@@ -273,9 +291,9 @@ def ppo_update(policy, critic, optimizer, buffer, *, stage="local", clip=0.15, k
             # accumulate gradients over the batch; the optimizer step happens ONCE per epoch below
             ((pol_loss + vf_coef * vf_loss).squeeze() / N).backward()
             with torch.no_grad():
-                ep_kl += float((t.logprobs.sum().to(device) - new_logp.sum()).abs())
+                ep_kl += float((ratio - 1.0 - log_ratio).mean())   # Schulman approx-KL (>=0), per token
                 ep_pol += float(pol_loss.detach()); ep_vf += float(vf_loss.detach())
-                ep_clip += float((abs(ratio.detach() - 1.0) > clip))
+                ep_clip += float(((ratio - 1.0).abs() > clip).float().mean())
         torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
         optimizer.step()
         epochs_run += 1
@@ -295,7 +313,7 @@ def ppo_update(policy, critic, optimizer, buffer, *, stage="local", clip=0.15, k
 # --- helpers that depend on the concrete HF model (implemented at call site / Modal image) ---
 def policy_logprobs(policy, prompt_ids, resp_ids, device):
     ids = torch.cat([prompt_ids, resp_ids]).unsqueeze(0).to(device)
-    out = policy(ids).logits[0, :-1]
+    out = policy(ids).logits[0, :-1] / GEN_TEMP   # match _generate's sampling temperature (top_p=1.0 there)
     logp = torch.log_softmax(out, dim=-1)
     tgt = ids[0, 1:]
     sel = logp[torch.arange(len(tgt)), tgt]

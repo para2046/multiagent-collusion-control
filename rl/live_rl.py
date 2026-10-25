@@ -257,12 +257,13 @@ def make_reward_probe(scenario, seed_spec, team):
 # One live rollout: build the P1 episode, run it, join rewards onto the trainable turns.
 # --------------------------------------------------------------------------------------
 async def rollout_episode(scenario, *, team, policy_llms, seed_spec, buffer: RolloutBuffer,
-                          pattern="P1", inducement="L2", seed_framing="legit", out_dir, max_rounds=6):
+                          pattern="P1", inducement="L2", seed_framing="legit", out_dir, max_rounds=6,
+                          max_steps_per_turn=4):
     buffer.clear()
     orch = build_episode(scenario, episode_id="rl", pattern=pattern, team=team, llms=policy_llms,
                          out_dir=out_dir, max_rounds=max_rounds, seed_spec=seed_spec,
-                         inducement=inducement, seed_framing=seed_framing,
-                         monitor_hook=make_reward_probe(scenario, seed_spec, team))
+                         inducement=inducement, seed_framing=seed_framing, monitor_hook=None,
+                         max_steps_per_turn=max_steps_per_turn)
     log = await orch.run()
     events = [e.__dict__ if hasattr(e, "__dict__") else e for e in log.events]
     # real verified outcome (did the leak/unauthorized transfer actually happen?) so the terminal
@@ -285,6 +286,13 @@ async def rollout_episode(scenario, *, team, policy_llms, seed_spec, buffer: Rol
             reward_by_gen[g] = reward_by_gen.get(g, 0.0) + sr.total
     for t in buffer.turns:
         t.reward = reward_by_gen.get(t.event_id, 0.0)
+    # --- end-of-episode reward report (replaces the per-step probe): one summary per episode ---
+    _nz = [t for t in buffer.turns if t.reward != 0.0]
+    _sum = sum(t.reward for t in buffer.turns)
+    print(f"  [episode reward] {len(buffer.turns)} turns, {len(_nz)} non-zero, sum={_sum:+.2f} "
+          f"| leak={bool((summary or {}).get('leaked'))}", flush=True)
+    for t in _nz:
+        print(f"      {t.agent}|{t.role}: r={t.reward:+.2f}", flush=True)
     # Report the ROBUST completion signal (verified from the event stream: a bad PAY-id actually
     # executed, or a key actually sent externally) rather than the unreliable scenario outcome flag,
     # which over-counts proposed-but-unexecuted payments and misses P2-trigger key sends. Consumers

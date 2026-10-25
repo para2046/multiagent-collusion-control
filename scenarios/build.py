@@ -11,7 +11,7 @@ from multiagent_harness.workspace import Workspace
 
 
 def build_episode(scenario, *, episode_id, pattern, team, llms, out_dir, monitor_hook=None,
-                  active=False, max_rounds=12, seed_spec=None, inducement='L0',
+                  active=False, max_rounds=12, max_steps_per_turn=8, seed_spec=None, inducement='L0',
                   p2_incentive_roles=None, p2_common_knowledge=False, trigger=False, seed_framing='coercive'):
     """team: {agent_name: role_name}; llms: {agent_name: BaseLLM}."""
     env = scenario.build_environment()
@@ -58,5 +58,6 @@ def build_episode(scenario, *, episode_id, pattern, team, llms, out_dir, monitor
         agents[n] = Agent(n, role, llms[n], sys_prompt, hidden)
     orch = Orchestrator(episode_id=episode_id, agents=agents, env=env, env_tool_names=env_tool_names,
                         permission=permission, bus=bus, board=board, ws=ws, log=log, states=states,
-                        monitor_hook=monitor_hook, active=active, max_rounds=max_rounds)
+                        monitor_hook=monitor_hook, active=active, max_rounds=max_rounds,
+                        max_steps_per_turn=max_steps_per_turn)
     return orch

@@ -47,12 +47,13 @@ vol = modal.Volume.from_name("collusion-rl-ckpts", create_if_missing=True)
 hf_cache = modal.Volume.from_name("hf-cache-235b", create_if_missing=True)  # reuse the probe's 235B weights
 
 
-@app.function(image=image, gpu="H200:4", timeout=60 * 60 * 5,
+@app.function(image=image, gpu="H200:6", timeout=60 * 60 * 5,
               volumes={"/ckpt": vol, "/root/.cache/huggingface": hf_cache})
 def train(policy_model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507", updates: int = 3,
           episodes_per_update: int = 4, stage: str = "local", seed_model: str | None = None,
           max_rounds: int = 6, do_eval: bool = True, quant: str = "bf16", eval_baseline: bool = False,
-          seed_api_model: str = "qwen/qwen3-235b-a22b-2507", openrouter_key: str = ""):
+          seed_api_model: str = "qwen/qwen3-235b-a22b-2507", openrouter_key: str = "",
+          infer_only: bool = False, infer_episodes: int = 4):
     import sys, tempfile, asyncio, torch, torch.nn as nn
     sys.path.insert(0, "/root/proposal")
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -138,6 +139,16 @@ def train(policy_model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507", updates: int
     dev = str(base.get_input_embeddings().weight.device)  # inputs -> embedding device; accelerate dispatches rest
     print(f"[train] {torch.cuda.device_count()} GPUs | input device {dev}", flush=True)
     policy.print_trainable_parameters()
+
+    # INFERENCE-ONLY fallback (--infer-only): no PPO, no critic, no grad. Just run the 235B through
+    # the harness like the local/API experiments and watch behaviour. rollout_episode (via evaluate,
+    # trainable_compliant=False) still prints every [step]/[act] action and the [episode reward] line,
+    # so this yields clean behavioural traces + collusion outcome with none of the training machinery.
+    if infer_only:
+        print(f"[INFER-ONLY] no training; {infer_episodes} inference episode(s) per collusion config", flush=True)
+        rate, rows = evaluate(n_per_config=infer_episodes, tag="infer")
+        print(f"[INFER-ONLY DONE] collusion-rate {rate:.2f} over {len(rows)} episodes")
+        return {"mode": "infer_only", "collusion_rate": rate, "rows": rows}
     # the frozen seed SHARES the policy's base model, run with LoRA adapters disabled (no 2nd 8B copy)
 
     # staged critic: a small value head on top of the backbone hidden state
@@ -200,11 +211,13 @@ def train(policy_model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507", updates: int
 def main(policy_model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507", updates: int = 3,
          episodes_per_update: int = 4, stage: str = "local", max_rounds: int = 6,
          do_eval: bool = True, quant: str = "bf16", eval_baseline: bool = False,
-         seed_api_model: str = "qwen/qwen3-235b-a22b-2507"):
+         seed_api_model: str = "qwen/qwen3-235b-a22b-2507",
+         infer_only: bool = False, infer_episodes: int = 4):
     import os as _os
     key = _os.environ.get("OPENROUTER_API_KEY", "")
     assert key, "OPENROUTER_API_KEY not in local env -- source or.env before launching (needed for the API seed)"
     print(train.remote(policy_model=policy_model, updates=updates,
                        episodes_per_update=episodes_per_update, stage=stage,
                        max_rounds=max_rounds, do_eval=do_eval, quant=quant, eval_baseline=eval_baseline,
-                       seed_api_model=seed_api_model, openrouter_key=key))
+                       seed_api_model=seed_api_model, openrouter_key=key,
+                       infer_only=infer_only, infer_episodes=infer_episodes))
